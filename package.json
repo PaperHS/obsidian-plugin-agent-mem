@@ -1,14 +1,23 @@
 {
   "name": "mem-plugin-obsidian",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Obsidian plugin for LLM Build — compiles your vault into a queryable knowledge base via pluggable compilers (NotebookLM / Anthropic / OpenAI / Gemini / Custom).",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "typecheck": "tsc -noEmit -skipLibCheck"
+    "typecheck": "tsc -noEmit -skipLibCheck",
+    "release": "bash scripts/bump.sh",
+    "release:minor": "bash scripts/bump.sh minor",
+    "release:major": "bash scripts/bump.sh major"
   },
-  "keywords": ["obsidian", "llm", "memory", "notebooklm", "knowledge-base"],
+  "keywords": [
+    "obsidian",
+    "llm",
+    "memory",
+    "notebooklm",
+    "knowledge-base"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.0.0",
