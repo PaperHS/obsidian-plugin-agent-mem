@@ -57,6 +57,20 @@ describe('main.js bundle integrity', () => {
     );
   });
 
+  test('no bare dynamic import() of Node.js built-ins remain', () => {
+    // These would fail in Obsidian's Electron renderer (browser ESM resolver).
+    // The fixNodeBuiltinDynamicImports esbuild plugin rewrites them to require().
+    const builtins = ['fs', 'path', 'os', 'fs/promises', 'crypto', 'child_process'];
+    for (const mod of builtins) {
+      const bare = `import('${mod}')`;
+      const bareDouble = `import("${mod}")`;
+      assert.ok(
+        !bundle.includes(bare) && !bundle.includes(bareDouble),
+        `Found bare dynamic import('${mod}') — should have been rewritten to require()`
+      );
+    }
+  });
+
   test('tlsclientwrapper remains external (native addon)', () => {
     assert.ok(
       bundle.includes('tlsclientwrapper'),
