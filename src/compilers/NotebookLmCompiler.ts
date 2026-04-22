@@ -1,6 +1,5 @@
 import type { CompilerAdapter } from './CompilerAdapter.js';
 import type { BuildResult, QueryResult, Source } from '../types.js';
-// loadLib handles auto-install + file:// resolution for the ESM-only package.
 import { loadLib as loadNotebookLmLib } from './notebooklmAuth.js';
 
 /**

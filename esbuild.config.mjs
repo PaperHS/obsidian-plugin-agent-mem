@@ -21,10 +21,11 @@ const context = await esbuild.context({
     '@lezer/common',
     '@lezer/highlight',
     '@lezer/lr',
-    'notebooklm-client',
+    // notebooklm-client is now bundled — all its deps are pure JS.
+    // Only keep out native/optional addons that can't be bundled.
     'ffi-rs',
-    'puppeteer',
-    'puppeteer-core',
+    'tlsclientwrapper',   // optional native dep inside notebooklm-client
+    'puppeteer',          // full puppeteer (not used; puppeteer-core is bundled)
     ...builtins,
   ],
   format: 'cjs',
