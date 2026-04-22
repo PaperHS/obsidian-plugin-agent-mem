@@ -14,6 +14,28 @@ export async function loadLib(): Promise<any> {
   return await import('notebooklm-client');
 }
 
+/**
+ * Resolve the NotebookClient constructor from a dynamically-imported lib object.
+ *
+ * When esbuild bundles ESM → CJS and one of the sub-module initialisers fails
+ * silently, named exports end up as `undefined` on the namespace object. We
+ * also guard against the export sitting on a `default` wrapper (some bundler
+ * interop patterns). Throws a clear error rather than letting V8 emit the
+ * opaque "X is not a constructor" message.
+ */
+function resolveNotebookClientCtor(lib: any): new () => any {
+  const Ctor: unknown = lib?.NotebookClient ?? lib?.default?.NotebookClient;
+  if (typeof Ctor !== 'function') {
+    const keys = lib ? Object.keys(lib).slice(0, 10).join(', ') : 'null';
+    throw new Error(
+      `NotebookClient constructor not found in notebooklm-client. ` +
+      `Available exports: [${keys}]. ` +
+      `This usually means a sub-module failed to initialise — check the console for earlier errors.`
+    );
+  }
+  return Ctor as new () => any;
+}
+
 export async function getSessionPath(homeDir?: string): Promise<string> {
   const lib: any = await loadLib();
   if (homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(homeDir);
@@ -51,8 +73,10 @@ export async function loginInteractive(opts: LoginOptions = {}): Promise<string>
   const lib: any = await loadLib();
   if (opts.homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(opts.homeDir);
 
+  const Ctor = resolveNotebookClientCtor(lib);
+
   opts.onLog?.('Launching Chrome… (log in to Google in the new window, then return here)');
-  const client = new lib.NotebookClient();
+  const client = new Ctor();
 
   const connectOpts: any = { transport: 'browser', headless: false };
   if (opts.chromePath) connectOpts.chromePath = opts.chromePath;
