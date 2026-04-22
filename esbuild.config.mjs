@@ -28,6 +28,20 @@ const context = await esbuild.context({
     'puppeteer',          // full puppeteer (not used; puppeteer-core is bundled)
     ...builtins,
   ],
+  // When bundling ESM modules (like notebooklm-client) into CJS format, esbuild
+  // replaces `import.meta` with an empty stub `{}`, leaving `import.meta.url`
+  // as undefined. The CurlTransport module calls `fileURLToPath(import.meta.url)`
+  // at init time, which throws and poisons the __commonJS module cache,
+  // preventing NotebookClient from ever being initialised.
+  //
+  // Fix: map import.meta.url → __importMetaUrl (a valid identifier for define),
+  // then inject its definition via banner so the CJS equivalent is always set.
+  define: {
+    'import.meta.url': '__importMetaUrl',
+  },
+  banner: {
+    js: `var __importMetaUrl = typeof __filename !== "undefined" ? require("url").pathToFileURL(__filename).href : "file:///obsidian-plugin.js";`,
+  },
   format: 'cjs',
   target: 'es2022',
   logLevel: 'info',
