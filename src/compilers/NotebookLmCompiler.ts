@@ -27,9 +27,21 @@ export class NotebookLmCompiler implements CompilerAdapter {
     this.opts = opts;
   }
 
+  private async loadNotebookLmLib(): Promise<any> {
+    // notebooklm-client is ESM-only and can't be bundled. Obsidian intercepts
+    // bare-specifier imports, so resolve to an absolute path then use file:// URL.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Module = require('module') as any;
+    const paths: string[] = Module._nodeModulePaths(
+      typeof __dirname !== 'undefined' ? __dirname : process.cwd()
+    );
+    const resolved: string = Module._resolveFilename('notebooklm-client', null, false, { paths });
+    return await import(`file://${resolved}`);
+  }
+
   private async ensureClient() {
     if (this.client) return;
-    const mod: any = await import('notebooklm-client');
+    const mod: any = await this.loadNotebookLmLib();
     const Ctor = mod.NotebookClient || mod.default?.NotebookClient;
     if (!Ctor) throw new Error('notebooklm-client: NotebookClient export not found');
     if (this.opts.homeDir && typeof mod.setHomeDir === 'function') mod.setHomeDir(this.opts.homeDir);

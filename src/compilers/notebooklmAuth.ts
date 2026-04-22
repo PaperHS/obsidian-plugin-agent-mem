@@ -11,7 +11,18 @@ export interface SessionStatus {
 }
 
 async function loadLib() {
-  return await import('notebooklm-client');
+  // notebooklm-client is ESM-only ("type":"module") and can't be bundled.
+  // Obsidian intercepts bare-specifier dynamic imports (browser-style), so a plain
+  // import('notebooklm-client') fails.  Workaround:
+  //   1. Use Node.js Module._resolveFilename to get the absolute disk path.
+  //   2. Import via file:// URL — Obsidian/Electron lets absolute file URLs through.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const Module = require('module') as any;
+  const paths: string[] = Module._nodeModulePaths(
+    typeof __dirname !== 'undefined' ? __dirname : process.cwd()
+  );
+  const resolved: string = Module._resolveFilename('notebooklm-client', null, false, { paths });
+  return await import(`file://${resolved}`);
 }
 
 export async function getSessionPath(homeDir?: string): Promise<string> {
