@@ -1,12 +1,14 @@
 import type { CompilerAdapter } from './CompilerAdapter.js';
 import type { BuildResult, QueryResult, Source } from '../types.js';
+// loadLib handles auto-install + file:// resolution for the ESM-only package.
+import { loadLib as loadNotebookLmLib } from './notebooklmAuth.js';
 
 /**
  * Adapter over `notebooklm-client`. Kept loosely-typed because the library
  * relies on a headless browser session and its surface has been evolving.
  *
- * Dynamic import avoids loading puppeteer/chromium until the user actually
- * selects NotebookLM as their provider.
+ * Module loading is delegated to notebooklmAuth.loadLib which auto-installs
+ * notebooklm-client to ~/.mem-plugin/ on first use if needed.
  */
 
 interface NotebookLmOptions {
@@ -27,47 +29,9 @@ export class NotebookLmCompiler implements CompilerAdapter {
     this.opts = opts;
   }
 
-  private async loadNotebookLmLib(): Promise<any> {
-    // notebooklm-client is ESM-only and can't be bundled. Obsidian intercepts
-    // bare-specifier imports, so resolve to an absolute disk path then import
-    // via file:// URL which Electron passes through without interception.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Module = require('module') as any;
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const cp = require('child_process') as typeof import('child_process');
-
-    const candidatePaths: string[] = [
-      ...Module._nodeModulePaths(typeof __dirname !== 'undefined' ? __dirname : process.cwd()),
-      ...NotebookLmCompiler.resolveGlobalNpmPaths(cp),
-      '/usr/local/lib/node_modules',
-      '/usr/lib/node_modules',
-    ];
-
-    let resolved: string;
-    try {
-      resolved = Module._resolveFilename('notebooklm-client', null, false, { paths: candidatePaths });
-    } catch {
-      throw new Error('notebooklm-client not found. Run: npm install -g notebooklm-client');
-    }
-    return await import(`file://${resolved}`);
-  }
-
-  private static resolveGlobalNpmPaths(cp: typeof import('child_process')): string[] {
-    try {
-      const root = cp.execFileSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 5000 }).trim();
-      return [root];
-    } catch {
-      const home = process.env.HOME ?? '';
-      return [
-        `${home}/.npm-global/lib/node_modules`,
-        `${home}/.nvm/versions/node/${process.version}/lib/node_modules`,
-      ];
-    }
-  }
-
   private async ensureClient() {
     if (this.client) return;
-    const mod: any = await this.loadNotebookLmLib();
+    const mod: any = await loadNotebookLmLib();
     const Ctor = mod.NotebookClient || mod.default?.NotebookClient;
     if (!Ctor) throw new Error('notebooklm-client: NotebookClient export not found');
     if (this.opts.homeDir && typeof mod.setHomeDir === 'function') mod.setHomeDir(this.opts.homeDir);

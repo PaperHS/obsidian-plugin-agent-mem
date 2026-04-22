@@ -2,6 +2,10 @@
  * NotebookLM session management for the settings UI.
  * Wraps notebooklm-client's session helpers with dynamic import so the
  * library (which pulls in puppeteer/ffi-rs) only loads when actually needed.
+ *
+ * Because notebooklm-client is ESM-only and can't be bundled, we locate it
+ * at runtime via Node's module resolution, auto-installing to ~/.mem-plugin/
+ * on first use if it isn't already available.
  */
 
 export interface SessionStatus {
@@ -10,44 +14,65 @@ export interface SessionStatus {
   checkedAt: string;
 }
 
-async function loadLib() {
-  // notebooklm-client is ESM-only and can't be bundled into the plugin.
-  // Obsidian intercepts bare-specifier dynamic imports (browser-style), so we:
-  //   1. Collect candidate node_modules paths (plugin dir, global npm, system paths).
-  //   2. Use Module._resolveFilename to find the absolute disk path.
-  //   3. Import via file:// URL — Obsidian/Electron passes absolute file URLs through.
+// Cached resolved file URL so we only run resolution/install once per session.
+let resolvedFileUrl: string | null = null;
+
+export async function loadLib(onLog?: (msg: string) => void): Promise<any> {
+  if (!resolvedFileUrl) {
+    resolvedFileUrl = await resolveNotebookLmClient(onLog);
+  }
+  return await import(/* @vite-ignore */ resolvedFileUrl);
+}
+
+// ── Module resolution ─────────────────────────────────────────────────────────
+
+async function resolveNotebookLmClient(onLog?: (msg: string) => void): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const Module = require('module') as any;
   // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const path = require('path') as typeof import('path');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const os = require('os') as typeof import('os');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   const cp = require('child_process') as typeof import('child_process');
 
+  const installDir = path.join(os.homedir(), '.mem-plugin');
+
   const candidatePaths: string[] = [
-    // Dev install: plugin's own node_modules
+    // Preferred: our own install dir (persists across plugin updates)
+    path.join(installDir, 'node_modules'),
+    // Dev: plugin's own node_modules
     ...Module._nodeModulePaths(typeof __dirname !== 'undefined' ? __dirname : process.cwd()),
-    // Global npm prefix
-    ...resolveGlobalNpmPaths(cp),
-    // Common system-wide paths (macOS / Linux)
+    // Global npm
+    ...getGlobalNpmPaths(cp),
+    // System-wide fallbacks
     '/usr/local/lib/node_modules',
     '/usr/lib/node_modules',
   ];
 
-  let resolved: string;
+  // First attempt — no install
   try {
-    resolved = Module._resolveFilename('notebooklm-client', null, false, { paths: candidatePaths });
-  } catch {
-    throw new Error(
-      'notebooklm-client not found. Run: npm install -g notebooklm-client'
-    );
-  }
-  return await import(`file://${resolved}`);
+    const p = Module._resolveFilename('notebooklm-client', null, false, { paths: candidatePaths });
+    return `file://${p}`;
+  } catch { /* not found yet */ }
+
+  // Auto-install to ~/.mem-plugin/
+  onLog?.('notebooklm-client not found — installing to ~/.mem-plugin/ (one-time setup)…');
+  await npmInstall('notebooklm-client', installDir, cp, onLog);
+  onLog?.('Install complete.');
+
+  // Second attempt after install
+  const p = Module._resolveFilename('notebooklm-client', null, false, {
+    paths: [path.join(installDir, 'node_modules'), ...candidatePaths],
+  });
+  return `file://${p}`;
 }
 
-function resolveGlobalNpmPaths(cp: typeof import('child_process')): string[] {
+function getGlobalNpmPaths(cp: typeof import('child_process')): string[] {
   try {
     const root = cp.execFileSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 5000 }).trim();
     return [root];
   } catch {
-    // npm not on PATH or timed out — try common prefix locations
     const home = process.env.HOME ?? '';
     return [
       `${home}/.npm-global/lib/node_modules`,
@@ -56,11 +81,41 @@ function resolveGlobalNpmPaths(cp: typeof import('child_process')): string[] {
   }
 }
 
+function npmInstall(
+  pkg: string,
+  prefix: string,
+  cp: typeof import('child_process'),
+  onLog?: (msg: string) => void,
+): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require('fs') as typeof import('fs');
+  fs.mkdirSync(prefix, { recursive: true });
+
+  return new Promise((resolve, reject) => {
+    const proc = cp.spawn(
+      'npm',
+      ['install', pkg, '--prefix', prefix, '--no-save'],
+      {
+        stdio: 'pipe',
+        // Skip Chromium download — user already has Chrome for the browser transport
+        env: { ...process.env, PUPPETEER_SKIP_DOWNLOAD: '1', PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: '1' },
+      },
+    );
+    proc.stdout?.on('data', (d: Buffer) => onLog?.(d.toString().trim()));
+    proc.stderr?.on('data', (d: Buffer) => onLog?.(d.toString().trim()));
+    proc.on('close', (code: number | null) => {
+      if (code === 0) resolve();
+      else reject(new Error(`npm install ${pkg} failed (exit ${code})`));
+    });
+    proc.on('error', reject);
+  });
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+
 export async function getSessionPath(homeDir?: string): Promise<string> {
   const lib: any = await loadLib();
-  if (homeDir && typeof lib.setHomeDir === 'function') {
-    lib.setHomeDir(homeDir);
-  }
+  if (homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(homeDir);
   return lib.getSessionPath();
 }
 
@@ -92,7 +147,8 @@ export interface LoginOptions {
  * session path on success.
  */
 export async function loginInteractive(opts: LoginOptions = {}): Promise<string> {
-  const lib: any = await loadLib();
+  // Pass onLog so auto-install progress is surfaced to the user.
+  const lib: any = await loadLib(opts.onLog);
   if (opts.homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(opts.homeDir);
 
   opts.onLog?.('Launching Chrome… (log in to Google in the new window, then return here)');
@@ -109,9 +165,7 @@ export async function loginInteractive(opts: LoginOptions = {}): Promise<string>
 
   try {
     await client.disconnect();
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return savedPath;
 }
 
@@ -120,9 +174,10 @@ export async function logout(homeDir?: string): Promise<string> {
   if (homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(homeDir);
 
   const sessionPath: string = lib.getSessionPath();
-  const fs = await import('node:fs/promises');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fs = require('fs') as typeof import('fs');
   try {
-    await fs.unlink(sessionPath);
+    fs.unlinkSync(sessionPath);
   } catch (e: any) {
     if (e?.code !== 'ENOENT') throw e;
   }

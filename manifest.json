@@ -1,7 +1,7 @@
 {
   "id": "mem-plugin-build",
   "name": "Mem Plugin Build",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "minAppVersion": "1.4.0",
   "description": "Pluggable LLM Build for your vault. Compiles Obsidian notes + session records into a queryable knowledge base via NotebookLM, Anthropic, OpenAI, Gemini, or custom providers.",
   "author": "mem-plugin",
