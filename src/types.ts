@@ -45,7 +45,12 @@ export interface MemPluginSettings {
   autoBuildOnChange: boolean;
   autoBuildDebounceMs: number;
   providers: {
-    notebooklm: { transport: 'auto' | 'puppeteer' | 'chromium'; pinnedNotebookId?: string };
+    notebooklm: {
+      transport: 'auto' | 'browser' | 'http' | 'curl-impersonate' | 'tls-client';
+      pinnedNotebookId?: string;
+      homeDir?: string;     // overrides ~/.notebooklm (sets NOTEBOOKLM_HOME equivalent)
+      chromePath?: string;  // Chrome executable for interactive login
+    };
     anthropic: ProviderConfig;
     openai: ProviderConfig;
     gemini: ProviderConfig;

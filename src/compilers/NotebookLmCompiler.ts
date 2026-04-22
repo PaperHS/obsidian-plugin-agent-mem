@@ -10,8 +10,10 @@ import type { BuildResult, QueryResult, Source } from '../types.js';
  */
 
 interface NotebookLmOptions {
-  transport?: 'auto' | 'puppeteer' | 'chromium';
+  transport?: 'auto' | 'browser' | 'http' | 'curl-impersonate' | 'tls-client';
   pinnedNotebookId?: string;
+  homeDir?: string;
+  chromePath?: string;
 }
 
 export class NotebookLmCompiler implements CompilerAdapter {
@@ -27,11 +29,15 @@ export class NotebookLmCompiler implements CompilerAdapter {
 
   private async ensureClient() {
     if (this.client) return;
-    const mod = await import('notebooklm-client');
-    const Ctor = (mod as any).NotebookClient || (mod as any).default?.NotebookClient;
+    const mod: any = await import('notebooklm-client');
+    const Ctor = mod.NotebookClient || mod.default?.NotebookClient;
     if (!Ctor) throw new Error('notebooklm-client: NotebookClient export not found');
+    if (this.opts.homeDir && typeof mod.setHomeDir === 'function') mod.setHomeDir(this.opts.homeDir);
+
     this.client = new Ctor();
-    await this.client.connect({ transport: this.opts.transport ?? 'auto' });
+    const connectOpts: any = { transport: this.opts.transport ?? 'auto' };
+    if (this.opts.chromePath) connectOpts.chromePath = this.opts.chromePath;
+    await this.client.connect(connectOpts);
   }
 
   private async ensureNotebook() {
