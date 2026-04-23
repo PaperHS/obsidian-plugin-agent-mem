@@ -165,7 +165,7 @@ export class MemPluginSettingTab extends PluginSettingTab {
               .setButtonText('Log in to NotebookLM')
               .setCta()
               .onClick(async () => {
-                const notice = new Notice('Opening Chrome — log in with your Google account, this dialog will close automatically…', 0);
+                const notice = new Notice('Chrome opened — log in to NotebookLM, then click "Save session" in the callback tab…', 0);
                 try {
                   const path = await loginInteractive({
                     homeDir: p.homeDir,

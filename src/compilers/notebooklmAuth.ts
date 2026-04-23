@@ -14,9 +14,6 @@ export async function loadLib(): Promise<any> {
   return await import('notebooklm-client');
 }
 
-/**
- * Resolve the NotebookClient constructor from a dynamically-imported lib object.
- */
 function resolveNotebookClientCtor(lib: any): new () => any {
   const Ctor: unknown = lib?.NotebookClient ?? lib?.default?.NotebookClient;
   if (typeof Ctor !== 'function') {
@@ -39,7 +36,6 @@ export async function getSessionPath(homeDir?: string): Promise<string> {
 export async function checkSession(homeDir?: string): Promise<SessionStatus> {
   const lib: any = await loadLib();
   if (homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(homeDir);
-
   const sessionPath: string = lib.getSessionPath();
   let loggedIn = false;
   try {
@@ -58,20 +54,22 @@ export interface LoginOptions {
   onLog?: (msg: string) => void;
 }
 
-// ─── macOS: open-in-existing-Chrome approach ──────────────────────────────────
+// ─── Shared constants ─────────────────────────────────────────────────────────
 
 const NOTEBOOKLM_URL = 'https://notebooklm.google.com/';
-const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const POLL_INTERVAL_MS = 5_000;
+const LOGIN_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const DEFAULT_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-/** Candidate Chrome cookie DB paths, tried in order. */
+// ─── macOS Chrome cookie extraction ──────────────────────────────────────────
+
 function chromeCookiePaths(): string[] {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const os = require('os') as typeof import('os');
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const path = require('path') as typeof import('path');
-  const home = os.homedir();
-  const base = path.join(home, 'Library/Application Support');
+  const base = path.join(os.homedir(), 'Library/Application Support');
   return [
     path.join(base, 'Google/Chrome/Default/Cookies'),
     path.join(base, 'Google/Chrome Beta/Default/Cookies'),
@@ -81,8 +79,17 @@ function chromeCookiePaths(): string[] {
 }
 
 /**
- * Read encrypted Google cookies from the Chrome SQLite store on macOS.
- * Decrypts with the AES-128-CBC key stored in the macOS Keychain.
+ * Return false if a string contains characters forbidden in HTTP header values
+ * (control characters 0x00-0x08, 0x0a-0x1f, and 0x7f).
+ */
+function isValidHeaderValue(v: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return !/[\x00-\x08\x0a-\x1f\x7f]/.test(v);
+}
+
+/**
+ * Read and decrypt Google cookies from Chrome's SQLite database on macOS.
+ * Cookies with invalid header characters are silently dropped.
  */
 async function readMacChromeCookies(): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -96,15 +103,13 @@ async function readMacChromeCookies(): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const fs = require('fs') as typeof import('fs');
 
-  // Find an accessible cookie database
   const dbPath = chromeCookiePaths().find(p => fs.existsSync(p));
   if (!dbPath) throw new Error('Chrome cookie database not found');
 
-  // Copy DB to avoid lock contention (Chrome uses WAL, reads are usually fine)
   const tmpDb = path.join(os.tmpdir(), `nbm-cookies-${Date.now()}.db`);
   fs.copyFileSync(dbPath, tmpDb);
 
-  // Retrieve the Chrome Safe Storage passphrase from Keychain
+  // Retrieve passphrase from macOS Keychain (prompts user the first time)
   let rawKey = '';
   for (const svc of ['Chrome Safe Storage', 'Chromium Safe Storage']) {
     try {
@@ -116,11 +121,10 @@ async function readMacChromeCookies(): Promise<string> {
   }
   if (!rawKey) throw new Error('Could not read Chrome encryption key from Keychain');
 
-  // Derive AES-128 key: PBKDF2-SHA1, salt='saltysalt', 1003 iterations, 16 bytes
+  // PBKDF2-SHA1: password=rawKey, salt='saltysalt', iterations=1003, dkLen=16
   const derivedKey = crypto.pbkdf2Sync(rawKey, 'saltysalt', 1003, 16, 'sha1');
   const iv = Buffer.alloc(16, 32); // 16 × 0x20 (space)
 
-  // Query all google.com cookies — use stdin to avoid shell quoting issues
   const sql = `SELECT name, hex(encrypted_value), host_key FROM cookies WHERE host_key LIKE '%.google.com';`;
   let jsonOut = '';
   try {
@@ -141,76 +145,71 @@ async function readMacChromeCookies(): Promise<string> {
   const cookies: string[] = [];
 
   for (const row of rows) {
-    const key = `${row.name}@${row.host_key}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const dupKey = `${row.name}@${row.host_key}`;
+    if (seen.has(dupKey)) continue;
+    seen.add(dupKey);
 
     try {
       const encBuf = Buffer.from(row['hex(encrypted_value)'], 'hex');
       if (encBuf.length === 0) continue;
 
-      // v10 prefix = AES-128-CBC encrypted
+      let value: string;
+
       if (encBuf.length > 3 && encBuf.slice(0, 3).toString('ascii') === 'v10') {
+        // AES-128-CBC + PKCS7 padding (Node strips padding automatically)
         const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv);
         const dec = Buffer.concat([decipher.update(encBuf.slice(3)), decipher.final()]);
-        cookies.push(`${row.name}=${dec.toString()}`);
+        value = dec.toString('utf8');
+      } else if (/^v\d{2}/.test(encBuf.slice(0, 3).toString('ascii'))) {
+        // Unknown versioned format (v11+) — skip rather than output garbage
+        continue;
       } else {
-        // Plain-text cookie (unusual but possible)
-        cookies.push(`${row.name}=${encBuf.toString()}`);
+        // Plain-text cookie (legacy / unencrypted)
+        value = encBuf.toString('utf8');
       }
+
+      // Drop cookies whose decrypted value is invalid for HTTP headers
+      if (!isValidHeaderValue(value)) continue;
+
+      cookies.push(`${row.name}=${value}`);
     } catch { /* skip undecryptable entries */ }
   }
 
   return cookies.join('; ');
 }
 
-/** Follow up to `maxRedirects` HTTP redirects; reject if we land on Google sign-in. */
-async function httpsGetFollowRedirects(
-  url: string,
-  headers: Record<string, string>,
-  maxRedirects = 4,
-): Promise<string> {
+/** Follow redirects; throw 'not-logged-in' if we land on accounts.google.com. */
+async function httpsGet(url: string, headers: Record<string, string>, hops = 5): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const https = require('https') as typeof import('https');
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const http = require('http') as typeof import('http');
 
   return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    const req = (mod as any).get(url, { headers }, (res: any) => {
+    const mod: any = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { headers }, (res: any) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
-        const next: string = res.headers.location;
-        if (next.includes('accounts.google.com')) {
-          reject(new Error('not-logged-in'));
-          return;
-        }
-        if (maxRedirects <= 0) { reject(new Error('Too many redirects')); return; }
-        httpsGetFollowRedirects(next, headers, maxRedirects - 1).then(resolve).catch(reject);
+        const loc: string = res.headers.location;
+        if (loc.includes('accounts.google.com')) { reject(new Error('not-logged-in')); return; }
+        if (hops <= 0) { reject(new Error('Too many redirects')); return; }
+        httpsGet(loc, headers, hops - 1).then(resolve).catch(reject);
         return;
       }
       let data = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk: string) => { data += chunk; });
+      res.on('data', (c: string) => { data += c; });
       res.on('end', () => resolve(data));
     });
     req.on('error', reject);
   });
 }
 
-/**
- * Fetch NotebookLM with Chrome cookies and extract WIZ_global_data tokens.
- * Throws 'not-logged-in' error if the page redirects to Google sign-in.
- */
-async function extractWizTokens(
-  cookieStr: string,
-): Promise<{ at: string; bl: string; fsid: string; userAgent: string }> {
-  const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
-           + '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
-
-  const html = await httpsGetFollowRedirects(NOTEBOOKLM_URL, {
+/** Fetch NotebookLM with Chrome cookies and extract WIZ_global_data tokens. */
+async function extractWizTokens(cookieStr: string) {
+  const html = await httpsGet(NOTEBOOKLM_URL, {
     Cookie: cookieStr,
-    'User-Agent': UA,
+    'User-Agent': DEFAULT_UA,
     'Accept-Language': 'en-US,en;q=0.9',
     Accept: 'text/html,application/xhtml+xml',
   });
@@ -220,71 +219,162 @@ async function extractWizTokens(
   const fsid = html.match(/"FdrFJe"\s*:\s*"([^"]+)"/)?.[1];
 
   if (!at) throw new Error('not-logged-in');
-
-  return { at, bl: bl ?? '', fsid: fsid ?? '', userAgent: UA };
+  return { at, bl: bl ?? '', fsid: fsid ?? '' };
 }
 
+// ─── Local HTTP server login page ─────────────────────────────────────────────
+
+const LOGIN_PAGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NotebookLM Login — Obsidian</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    background:#0d1117;color:#e6edf3;display:flex;align-items:center;
+    justify-content:center;min-height:100vh;margin:0}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:12px;
+    padding:40px 48px;max-width:480px;width:100%;text-align:center}
+  h1{font-size:1.4rem;margin:0 0 8px}
+  p{color:#8b949e;margin:0 0 28px;line-height:1.5}
+  button{background:#238636;color:#fff;border:none;border-radius:6px;
+    padding:12px 28px;font-size:1rem;cursor:pointer;transition:background .15s}
+  button:hover:not(:disabled){background:#2ea043}
+  button:disabled{background:#21262d;color:#484f58;cursor:not-allowed}
+  #status{margin-top:20px;font-size:.9rem;min-height:1.2em}
+  .ok{color:#3fb950}.err{color:#f85149}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>NotebookLM Login</h1>
+  <p>Log in to NotebookLM in the other tab,<br>then click the button below.</p>
+  <button id="btn" onclick="complete()">I've logged in &mdash; Save session</button>
+  <div id="status"></div>
+</div>
+<script>
+async function complete() {
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  status.textContent = 'Extracting session…';
+  status.className = '';
+  try {
+    const res = await fetch('/complete', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      status.innerHTML = '&#10003; Done! Session saved. You can close this tab.';
+      status.className = 'ok';
+    } else {
+      status.textContent = 'Error: ' + data.error;
+      status.className = 'err';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    status.className = 'err';
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>`;
+
 /**
- * Open NotebookLM in the user's already-running Chrome, poll Chrome's cookie
- * database until login is detected, then save the session via notebooklm-client.
+ * macOS login via existing Chrome + local callback server.
  *
- * macOS-only (uses sqlite3 + Keychain).
+ * 1. Starts a local HTTP server on a random port.
+ * 2. Opens two Chrome tabs: NotebookLM (for login) and our local page (Done button).
+ * 3. When the user clicks Done, the server reads Chrome's cookie database,
+ *    verifies the session against NotebookLM, and saves it.
  */
-async function loginWithExistingChrome(lib: any, opts: LoginOptions): Promise<string> {
-  // Guard: macOS only
+async function loginWithLocalServer(lib: any, opts: LoginOptions): Promise<string> {
   if (process.platform !== 'darwin') throw new Error('macOS only');
 
   // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { execSync } = require('child_process') as typeof import('child_process');
+  const http = require('http') as typeof import('http');
 
-  // Verify sqlite3 CLI is present (it ships with macOS)
-  try { execSync('which sqlite3', { stdio: 'pipe' }); } catch {
-    throw new Error('sqlite3 CLI not found');
-  }
+  const sessionPath: string = lib.getSessionPath();
 
-  // Open NotebookLM in the user's existing Chrome
+  let resolveLogin!: (path: string) => void;
+  let rejectLogin!: (err: Error) => void;
+  const loginPromise = new Promise<string>((res, rej) => {
+    resolveLogin = res;
+    rejectLogin = rej;
+  });
+
+  const server = http.createServer(async (req: any, res: any) => {
+    const url: string = req.url ?? '/';
+
+    if (req.method === 'GET' && url === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(LOGIN_PAGE_HTML);
+      return;
+    }
+
+    if (req.method === 'POST' && url === '/complete') {
+      try {
+        opts.onLog?.('Extracting Chrome session…');
+        const cookieStr = await readMacChromeCookies();
+        if (!cookieStr) throw new Error('No Google cookies found in Chrome. Please log in first.');
+
+        opts.onLog?.('Verifying login with NotebookLM…');
+        const { at, bl, fsid } = await extractWizTokens(cookieStr);
+
+        const session = { at, bl, fsid, cookies: cookieStr, userAgent: DEFAULT_UA, language: 'en-US' };
+        const saveSession = lib.saveSession ?? lib.default?.saveSession;
+        if (typeof saveSession !== 'function') throw new Error('saveSession not found in notebooklm-client');
+
+        const savedPath: string = await saveSession(session, sessionPath);
+        opts.onLog?.(`Session saved → ${savedPath}`);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, path: savedPath }));
+        resolveLogin(savedPath);
+      } catch (err: any) {
+        const msg: string = err?.message === 'not-logged-in'
+          ? 'Not logged in to NotebookLM yet — please complete Google sign-in first.'
+          : (err?.message ?? String(err));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: msg }));
+        // Don't reject — let the user retry by clicking the button again
+      }
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.listen(0, '127.0.0.1', resolve as any);
+    server.on('error', reject);
+  });
+
+  const port = (server.address() as any).port as number;
+  const localUrl = `http://127.0.0.1:${port}/`;
+
+  // Open Chrome: NotebookLM first, then our callback page (ends up focused)
   try {
+    const { execSync } = require('child_process') as typeof import('child_process');
     execSync(`open -a "Google Chrome" "${NOTEBOOKLM_URL}"`, { stdio: 'pipe' });
+    execSync(`open -a "Google Chrome" "${localUrl}"`, { stdio: 'pipe' });
   } catch {
-    // Chrome not installed or launch failed — caller will fall back
     throw new Error('Could not open Google Chrome');
   }
 
-  opts.onLog?.(
-    'Chrome opened — please log in with your Google account. '
-    + 'This dialog will close automatically once login is detected.'
+  opts.onLog?.(`Log in to NotebookLM in Chrome, then click "Save session" in the other tab (${localUrl})`);
+
+  const timeout = new Promise<never>((_, rej) =>
+    setTimeout(() => rej(new Error(`Login timed out after ${LOGIN_TIMEOUT_MS / 60_000} minutes`)), LOGIN_TIMEOUT_MS)
   );
 
-  // Poll Chrome's cookie store until login is confirmed or we time out
-  const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-  const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-
-  while (Date.now() < deadline) {
-    await sleep(POLL_INTERVAL_MS);
-    try {
-      const cookieStr = await readMacChromeCookies();
-      if (!cookieStr) continue;
-
-      const { at, bl, fsid, userAgent } = await extractWizTokens(cookieStr);
-
-      const sessionPath: string = lib.getSessionPath();
-      const session = { at, bl, fsid, cookies: cookieStr, userAgent, language: 'en-US' };
-
-      const saveSession = lib.saveSession ?? lib.default?.saveSession;
-      if (typeof saveSession !== 'function') {
-        throw new Error('saveSession not found in notebooklm-client exports');
-      }
-
-      const savedPath: string = await saveSession(session, sessionPath);
-      opts.onLog?.(`Session saved to ${savedPath}`);
-      return savedPath;
-    } catch (err: any) {
-      if (err?.message === 'not-logged-in') continue; // not done yet
-      throw err; // real error
-    }
+  try {
+    return await Promise.race([loginPromise, timeout]);
+  } finally {
+    server.close();
   }
-
-  throw new Error(`Login timed out after ${LOGIN_TIMEOUT_MS / 60_000} minutes.`);
 }
 
 // ─── Fallback: puppeteer transport ────────────────────────────────────────────
@@ -308,11 +398,11 @@ async function loginWithPuppeteer(lib: any, opts: LoginOptions): Promise<string>
 /**
  * Log in to NotebookLM interactively.
  *
- * On macOS: opens a tab in the user's already-running Chrome, then polls
- * Chrome's on-disk cookie database until login is detected (no new process,
- * passkeys and saved Google accounts work normally).
+ * macOS: opens NotebookLM in the user's existing Chrome + a local callback
+ * page. The user logs in, clicks "Save session", and the session is extracted
+ * from Chrome's on-disk cookie database (no new Chrome process, passkeys work).
  *
- * Fallback: puppeteer BrowserTransport (spawns a new Chrome window).
+ * Other platforms / fallback: puppeteer BrowserTransport (new Chrome window).
  */
 export async function loginInteractive(opts: LoginOptions = {}): Promise<string> {
   const lib: any = await loadLib();
@@ -320,12 +410,12 @@ export async function loginInteractive(opts: LoginOptions = {}): Promise<string>
 
   if (process.platform === 'darwin') {
     try {
-      return await loginWithExistingChrome(lib, opts);
+      return await loginWithLocalServer(lib, opts);
     } catch (err: any) {
-      // Only fall through on setup failures, not polling errors
       const msg: string = err?.message ?? '';
-      if (msg === 'macOS only' || msg.includes('sqlite3') || msg.includes('Chrome')) {
-        console.warn('[notebooklmAuth] existing-Chrome approach unavailable, using puppeteer:', msg);
+      // Only fall through on setup errors (Chrome not installed, not macOS, etc.)
+      if (msg.includes('macOS only') || msg.includes('Chrome') || msg.includes('sqlite3')) {
+        console.warn('[notebooklmAuth] local-server approach unavailable, using puppeteer:', msg);
         // fall through
       } else {
         throw err;
@@ -339,7 +429,6 @@ export async function loginInteractive(opts: LoginOptions = {}): Promise<string>
 export async function logout(homeDir?: string): Promise<string> {
   const lib: any = await loadLib();
   if (homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(homeDir);
-
   const sessionPath: string = lib.getSessionPath();
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const fs = require('fs') as typeof import('fs');
