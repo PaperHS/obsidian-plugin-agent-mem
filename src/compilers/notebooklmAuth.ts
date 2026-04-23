@@ -72,13 +72,33 @@ export async function loginInteractive(opts: LoginOptions = {}): Promise<string>
   const lib: any = await loadLib();
   if (opts.homeDir && typeof lib.setHomeDir === 'function') lib.setHomeDir(opts.homeDir);
 
+  // Remove stale Chrome lock files left by a previous crashed session.
+  // Without this, Chrome sees SingletonLock, hands off to the existing window,
+  // and exits immediately — causing puppeteer's "Failed to launch the browser process!" error.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require('path') as typeof import('path');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const os = require('os') as typeof import('os');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require('fs') as typeof import('fs');
+    const home = opts.homeDir
+      ?? process.env['NOTEBOOKLM_HOME']
+      ?? path.join(os.homedir(), '.notebooklm');
+    const profileDir = path.join(home, 'chrome-profile');
+    for (const lock of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+      try { fs.unlinkSync(path.join(profileDir, lock)); } catch { /* not present */ }
+    }
+  } catch { /* non-critical */ }
+
   const Ctor = resolveNotebookClientCtor(lib);
 
   opts.onLog?.('Launching Chrome — log in to Google in the new window, then return here…');
   const client = new Ctor();
 
+  // notebooklm-client's launchBrowser reads `executablePath`, not `chromePath`
   const connectOpts: any = { transport: 'browser', headless: false };
-  if (opts.chromePath) connectOpts.chromePath = opts.chromePath;
+  if (opts.chromePath) connectOpts.executablePath = opts.chromePath;
 
   await client.connect(connectOpts);
   opts.onLog?.('Chrome connected. Saving session…');
