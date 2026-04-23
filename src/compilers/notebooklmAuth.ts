@@ -64,18 +64,40 @@ const DEFAULT_UA =
 
 // ─── macOS Chrome cookie extraction ──────────────────────────────────────────
 
-function chromeCookiePaths(): string[] {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const os = require('os') as typeof import('os');
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const path = require('path') as typeof import('path');
+const CHROME_VARIANTS = [
+  { dir: 'Google/Chrome',        keychainSvc: 'Chrome Safe Storage' },
+  { dir: 'Google/Chrome Beta',   keychainSvc: 'Chrome Safe Storage' },
+  { dir: 'Google/Chrome Canary', keychainSvc: 'Chrome Safe Storage' },
+  { dir: 'Chromium',             keychainSvc: 'Chromium Safe Storage' },
+];
+
+/**
+ * Return all Chrome cookie DB paths across every profile directory and
+ * every installed Chrome variant.  Searches Default + "Profile N" + "Guest Profile".
+ */
+function allChromeCookiePaths(fs: typeof import('fs'), path: typeof import('path'), os: typeof import('os')): string[] {
   const base = path.join(os.homedir(), 'Library/Application Support');
-  return [
-    path.join(base, 'Google/Chrome/Default/Cookies'),
-    path.join(base, 'Google/Chrome Beta/Default/Cookies'),
-    path.join(base, 'Google/Chrome Canary/Default/Cookies'),
-    path.join(base, 'Chromium/Default/Cookies'),
-  ];
+  const found: string[] = [];
+
+  for (const v of CHROME_VARIANTS) {
+    const variantBase = path.join(base, v.dir);
+    if (!fs.existsSync(variantBase)) continue;
+
+    let profileDirs: string[] = ['Default'];
+    try {
+      const entries = fs.readdirSync(variantBase);
+      for (const e of entries) {
+        if (/^Profile \d+$/.test(e) || e === 'Guest Profile') profileDirs.push(e);
+      }
+    } catch { /* ignore */ }
+
+    for (const profile of profileDirs) {
+      const p = path.join(variantBase, profile, 'Cookies');
+      if (fs.existsSync(p)) found.push(p);
+    }
+  }
+
+  return found;
 }
 
 /**
@@ -87,11 +109,32 @@ function isValidHeaderValue(v: string): boolean {
   return !/[\x00-\x08\x0a-\x1f\x7f]/.test(v);
 }
 
+/** Copy a Chrome SQLite DB plus its WAL/SHM files so recent writes are included. */
+function copyWithWal(src: string, dst: string, fs: typeof import('fs')): void {
+  fs.copyFileSync(src, dst);
+  for (const suffix of ['-wal', '-shm']) {
+    const walSrc = src + suffix;
+    if (fs.existsSync(walSrc)) {
+      try { fs.copyFileSync(walSrc, dst + suffix); } catch { /* best effort */ }
+    }
+  }
+}
+
+/** Clean up a temp DB copy and its WAL/SHM. */
+function removeTmpDb(p: string, fs: typeof import('fs')): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { fs.unlinkSync(p + suffix); } catch { /* ignore */ }
+  }
+}
+
 /**
- * Read and decrypt Google cookies from Chrome's SQLite database on macOS.
- * Cookies with invalid header characters are silently dropped.
+ * Read and decrypt Google cookies from ALL Chrome profiles on macOS.
+ * Searches every installed Chrome variant and every profile directory so
+ * the user's active profile is always found regardless of which one is open.
+ * Copies the WAL file alongside the DB so freshly-written login cookies are included.
+ * Cookies with invalid HTTP header characters are silently dropped.
  */
-async function readMacChromeCookies(): Promise<string> {
+async function readMacChromeCookies(onLog?: (m: string) => void): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { execSync } = require('child_process') as typeof import('child_process');
   // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -103,78 +146,92 @@ async function readMacChromeCookies(): Promise<string> {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const fs = require('fs') as typeof import('fs');
 
-  const dbPath = chromeCookiePaths().find(p => fs.existsSync(p));
-  if (!dbPath) throw new Error('Chrome cookie database not found');
+  const dbPaths = allChromeCookiePaths(fs, path, os);
+  if (dbPaths.length === 0) throw new Error('Chrome cookie database not found. Is Chrome installed?');
+  onLog?.(`Found ${dbPaths.length} Chrome profile DB(s)`);
 
-  const tmpDb = path.join(os.tmpdir(), `nbm-cookies-${Date.now()}.db`);
-  fs.copyFileSync(dbPath, tmpDb);
-
-  // Retrieve passphrase from macOS Keychain (prompts user the first time)
-  let rawKey = '';
-  for (const svc of ['Chrome Safe Storage', 'Chromium Safe Storage']) {
-    try {
-      rawKey = execSync(`security find-generic-password -w -s '${svc}' 2>/dev/null`, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-      }).toString().trim();
-      if (rawKey) break;
-    } catch { /* try next */ }
-  }
-  if (!rawKey) throw new Error('Could not read Chrome encryption key from Keychain');
-
-  // PBKDF2-SHA1: password=rawKey, salt='saltysalt', iterations=1003, dkLen=16
-  const derivedKey = crypto.pbkdf2Sync(rawKey, 'saltysalt', 1003, 16, 'sha1');
+  // Cache derived keys per Keychain service
+  const keyCache = new Map<string, Buffer>();
   const iv = Buffer.alloc(16, 32); // 16 × 0x20 (space)
 
-  const sql = `SELECT name, hex(encrypted_value), host_key FROM cookies WHERE host_key LIKE '%.google.com';`;
-  let jsonOut = '';
-  try {
-    jsonOut = execSync(`sqlite3 -json "${tmpDb}"`, {
-      input: sql,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    }).toString().trim();
-  } finally {
-    try { fs.unlinkSync(tmpDb); } catch { /* ignore */ }
+  function getDerivedKey(svc: string): Buffer | null {
+    if (keyCache.has(svc)) return keyCache.get(svc)!;
+    try {
+      const raw = execSync(`security find-generic-password -w -s '${svc}' 2>/dev/null`, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).toString().trim();
+      if (!raw) return null;
+      const dk = crypto.pbkdf2Sync(raw, 'saltysalt', 1003, 16, 'sha1');
+      keyCache.set(svc, dk);
+      return dk;
+    } catch { return null; }
   }
-
-  if (!jsonOut) return '';
-
-  type Row = { name: string; 'hex(encrypted_value)': string; host_key: string };
-  const rows: Row[] = JSON.parse(jsonOut);
 
   const seen = new Set<string>();
   const cookies: string[] = [];
+  const sql = `SELECT name, hex(encrypted_value), host_key FROM cookies WHERE host_key LIKE '%.google.com';`;
 
-  for (const row of rows) {
-    const dupKey = `${row.name}@${row.host_key}`;
-    if (seen.has(dupKey)) continue;
-    seen.add(dupKey);
+  for (const dbPath of dbPaths) {
+    const svc = dbPath.includes('Chromium') ? 'Chromium Safe Storage' : 'Chrome Safe Storage';
+    const derivedKey = getDerivedKey(svc);
+    if (!derivedKey) continue;
 
+    const tmpDb = path.join(
+      os.tmpdir(),
+      `nbm-cookies-${Date.now()}-${Math.random().toString(36).slice(2)}.db`,
+    );
     try {
-      const encBuf = Buffer.from(row['hex(encrypted_value)'], 'hex');
-      if (encBuf.length === 0) continue;
+      copyWithWal(dbPath, tmpDb, fs);
 
-      let value: string;
+      let jsonOut = '';
+      try {
+        jsonOut = execSync(`sqlite3 -json "${tmpDb}"`, {
+          input: sql,
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }).toString().trim();
+      } catch { /* DB locked or corrupt — skip this profile */ }
 
-      if (encBuf.length > 3 && encBuf.slice(0, 3).toString('ascii') === 'v10') {
-        // AES-128-CBC + PKCS7 padding (Node strips padding automatically)
-        const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv);
-        const dec = Buffer.concat([decipher.update(encBuf.slice(3)), decipher.final()]);
-        value = dec.toString('utf8');
-      } else if (/^v\d{2}/.test(encBuf.slice(0, 3).toString('ascii'))) {
-        // Unknown versioned format (v11+) — skip rather than output garbage
-        continue;
-      } else {
-        // Plain-text cookie (legacy / unencrypted)
-        value = encBuf.toString('utf8');
+      if (!jsonOut) continue;
+
+      type Row = { name: string; 'hex(encrypted_value)': string; host_key: string };
+      const rows: Row[] = JSON.parse(jsonOut);
+      onLog?.(`  ${dbPath.replace(os.homedir(), '~')}: ${rows.length} row(s)`);
+
+      for (const row of rows) {
+        const dupKey = `${row.name}@${row.host_key}`;
+        if (seen.has(dupKey)) continue;
+        seen.add(dupKey);
+
+        try {
+          const encBuf = Buffer.from(row['hex(encrypted_value)'], 'hex');
+          if (encBuf.length === 0) continue;
+
+          let value: string;
+
+          if (encBuf.length > 3 && encBuf.slice(0, 3).toString('ascii') === 'v10') {
+            // AES-128-CBC + PKCS7 padding (Node strips padding automatically)
+            const decipher = crypto.createDecipheriv('aes-128-cbc', derivedKey, iv);
+            const dec = Buffer.concat([decipher.update(encBuf.slice(3)), decipher.final()]);
+            value = dec.toString('utf8');
+          } else if (/^v\d{2}/.test(encBuf.slice(0, 3).toString('ascii'))) {
+            // Unknown versioned format (v11+) — skip rather than output garbage
+            continue;
+          } else {
+            // Plain-text cookie (legacy / unencrypted)
+            value = encBuf.toString('utf8');
+          }
+
+          // Drop cookies whose decrypted value is invalid for HTTP headers
+          if (!isValidHeaderValue(value)) continue;
+          cookies.push(`${row.name}=${value}`);
+        } catch { /* skip undecryptable entries */ }
       }
-
-      // Drop cookies whose decrypted value is invalid for HTTP headers
-      if (!isValidHeaderValue(value)) continue;
-
-      cookies.push(`${row.name}=${value}`);
-    } catch { /* skip undecryptable entries */ }
+    } finally {
+      removeTmpDb(tmpDb, fs);
+    }
   }
 
+  onLog?.(`Total cookies collected: ${cookies.length}`);
   return cookies.join('; ');
 }
 
@@ -316,8 +373,8 @@ async function loginWithLocalServer(lib: any, opts: LoginOptions): Promise<strin
     if (req.method === 'POST' && url === '/complete') {
       try {
         opts.onLog?.('Extracting Chrome session…');
-        const cookieStr = await readMacChromeCookies();
-        if (!cookieStr) throw new Error('No Google cookies found in Chrome. Please log in first.');
+        const cookieStr = await readMacChromeCookies(opts.onLog);
+        if (!cookieStr) throw new Error('No Google cookies found across all Chrome profiles. Make sure you completed the Google sign-in in the NotebookLM tab.');
 
         opts.onLog?.('Verifying login with NotebookLM…');
         const { at, bl, fsid } = await extractWizTokens(cookieStr);
