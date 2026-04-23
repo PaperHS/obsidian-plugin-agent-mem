@@ -45,16 +45,15 @@ const fixNodeBuiltinDynamicImports = {
         console.log('[fix-labs-tailwind] patched labs-tailwind guard → true');
       }
 
-      // Fix `x?.unref()` → `x?.unref?.()` throughout the bundle.
+      // Fix `.unref()` → `.unref?.()` throughout the bundle.
       // In Obsidian's Chromium renderer, setTimeout/setInterval return plain numbers,
-      // not Node.js Timeout objects with .unref(). Optional-chaining the call site
-      // (`?.()`) avoids the "is not a function" TypeError at plugin load time.
+      // not Node.js Timeout objects with .unref(). Making the call optional (`?.()`)
+      // avoids the "is not a function" TypeError at plugin load time.
       const beforeUnref = content;
-      content = content.replace(/(\?\.[A-Za-z$_][A-Za-z0-9$_]*)\.unref\(\)/g, '$1.unref?.()');
-      content = content.replace(/\.unref\(\)/g, '?.unref?.()');
+      content = content.replace(/\.unref\(\)/g, '.unref?.()');
       if (content !== beforeUnref) {
         const count = (beforeUnref.match(/\.unref\(\)/g) || []).length;
-        console.log(`[fix-unref] patched ${count} .unref() call(s) → ?.unref?.()`);
+        console.log(`[fix-unref] patched ${count} .unref() call(s) → .unref?.()`);
       }
 
       if (content !== before) {
