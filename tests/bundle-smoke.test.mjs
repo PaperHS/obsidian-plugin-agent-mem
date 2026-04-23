@@ -89,6 +89,14 @@ describe('main.js bundle integrity', () => {
     );
   });
 
+  test('labs-tailwind guard is patched out', () => {
+    assert.ok(
+      !bundle.includes('labs-tailwind'),
+      "Found hardcoded 'labs-tailwind' check — esbuild patch not applied. " +
+      'This guard blocks login when NotebookLM updates their build label.'
+    );
+  });
+
   test('bundle exports a default plugin (Obsidian entry point)', () => {
     // The CJS bundle must call module.exports = ... with the plugin class.
     assert.ok(

@@ -33,11 +33,23 @@ const fixNodeBuiltinDynamicImports = {
         'Promise.resolve(require($1$2$1))'
       );
 
+      // Patch out the brittle 'labs-tailwind' build-label guard in BrowserTransport.init().
+      // Google changes deployment labels — this check permanently blocks login when
+      // NotebookLM updates their build identifier (cfb2h no longer contains 'labs-tailwind').
+      const beforeLabels = content;
+      content = content.replace(
+        /\w+\.includes\(["']labs-tailwind["']\)/g,
+        'true'
+      );
+      if (content !== beforeLabels) {
+        console.log('[fix-labs-tailwind] patched labs-tailwind guard → true');
+      }
+
       if (content !== before) {
         await fs.writeFile(outfile, content);
         const count = (before.match(/\bimport\(['"][^'"]+['"]\)/g) || []).length
                     - (content.match(/\bimport\(['"][^'"]+['"]\)/g) || []).length;
-        console.log(`[fix-node-builtin-dynamic-imports] rewrote ${count} dynamic import(s) → require()`);
+        if (count > 0) console.log(`[fix-node-builtin-dynamic-imports] rewrote ${count} dynamic import(s) → require()`);
       }
     });
   },
