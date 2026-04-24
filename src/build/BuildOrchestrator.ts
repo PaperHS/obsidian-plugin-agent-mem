@@ -11,6 +11,8 @@ export interface BuildReport {
   writtenFiles: string[];
   provider: string;
   notebookId?: string;
+  /** Vault-relative folders that were used for filtering (empty = entire vault). */
+  effectiveFolders: string[];
 }
 
 export class BuildOrchestrator {
@@ -19,18 +21,30 @@ export class BuildOrchestrator {
     private readonly settings: MemPluginSettings
   ) {}
 
-  async collectVaultSources(): Promise<Source[]> {
+  /** Normalize a folder entry to a vault-relative path (strips vault base if user pasted an absolute path). */
+  private normalizeFolder(dir: string): string {
+    const trimmed = dir.replace(/\/$/, '').trim();
+    const basePath: string = (this.app.vault.adapter as any).basePath ?? '';
+    if (basePath && trimmed.startsWith(basePath)) {
+      return trimmed.slice(basePath.length).replace(/^[\\/]/, '');
+    }
+    return trimmed;
+  }
+
+  async collectVaultSources(): Promise<{ sources: Source[]; effectiveFolders: string[] }> {
     const { includeFolders, excludeFolders, fileExtensions } = this.settings;
     const files = this.app.vault.getFiles() as TFile[];
     const exts = fileExtensions.length ? fileExtensions : ['.md'];
 
+    const normInclude = includeFolders.map((d) => this.normalizeFolder(d)).filter(Boolean);
+    const normExclude = excludeFolders.map((d) => this.normalizeFolder(d)).filter(Boolean);
+
     const included = files.filter((f) => {
       const p = f.path;
-      const extOk = exts.some((e) => p.endsWith(e));
-      if (!extOk) return false;
-      if (excludeFolders.some((dir) => p.startsWith(dir.replace(/\/$/, '') + '/'))) return false;
-      if (includeFolders.length === 0) return true;
-      return includeFolders.some((dir) => p.startsWith(dir.replace(/\/$/, '') + '/'));
+      if (!exts.some((e) => p.endsWith(e))) return false;
+      if (normExclude.some((dir) => p.startsWith(dir + '/'))) return false;
+      if (normInclude.length === 0) return true;
+      return normInclude.some((dir) => p.startsWith(dir + '/'));
     });
 
     const sources: Source[] = [];
@@ -38,7 +52,7 @@ export class BuildOrchestrator {
       const content = await this.app.vault.cachedRead(f);
       sources.push({ id: f.path, title: f.basename, path: f.path, content });
     }
-    return sources;
+    return { sources, effectiveFolders: normInclude };
   }
 
   async collectRawStoreSources(): Promise<Source[]> {
@@ -64,13 +78,13 @@ export class BuildOrchestrator {
   }
 
   async run(compiler: CompilerAdapter): Promise<BuildReport> {
-    const [vaultSources, rawSources] = await Promise.all([
+    const [{ sources: vaultSources, effectiveFolders }, rawSources] = await Promise.all([
       this.collectVaultSources(),
       this.collectRawStoreSources(),
     ]);
     const sources = [...vaultSources, ...rawSources];
     if (sources.length === 0) {
-      return { sourceCount: 0, entryCount: 0, writtenFiles: [], provider: compiler.id };
+      return { sourceCount: 0, entryCount: 0, writtenFiles: [], provider: compiler.id, effectiveFolders };
     }
 
     const result: BuildResult = await compiler.build(sources);
@@ -87,6 +101,7 @@ export class BuildOrchestrator {
       writtenFiles,
       provider: compiler.id,
       notebookId: result.meta?.notebookId,
+      effectiveFolders,
     };
   }
 }

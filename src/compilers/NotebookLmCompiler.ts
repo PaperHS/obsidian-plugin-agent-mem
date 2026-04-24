@@ -1,5 +1,5 @@
 import type { CompilerAdapter } from './CompilerAdapter.js';
-import type { BuildResult, QueryResult, Source } from '../types.js';
+import type { BuildResult, KnowledgeEntry, QueryResult, Source } from '../types.js';
 import { loadLib as loadNotebookLmLib } from './notebooklmAuth.js';
 
 /**
@@ -35,6 +35,14 @@ export class NotebookLmCompiler implements CompilerAdapter {
     if (!Ctor) throw new Error('notebooklm-client: NotebookClient export not found');
     if (this.opts.homeDir && typeof mod.setHomeDir === 'function') mod.setHomeDir(this.opts.homeDir);
 
+    // Fail fast if no session — connect() hangs indefinitely without one.
+    if (typeof mod.hasValidSession === 'function') {
+      const valid = await mod.hasValidSession();
+      if (!valid) {
+        throw new Error('No valid NotebookLM session — please log in via Settings → Provider settings → Log in to NotebookLM');
+      }
+    }
+
     this.client = new Ctor();
     const connectOpts: any = { transport: this.opts.transport ?? 'auto' };
     if (this.opts.chromePath) connectOpts.chromePath = this.opts.chromePath;
@@ -62,16 +70,13 @@ export class NotebookLmCompiler implements CompilerAdapter {
       if (res?.sourceId) this.sourceIds.push(res.sourceId);
     }
 
-    // NotebookLM does the compilation internally. We don't pull a JSON KB back;
-    // instead we record the notebook state and defer actual retrieval to query().
+    // Give NotebookLM a moment to index the newly uploaded sources before querying.
+    await new Promise((r) => setTimeout(r, 5_000));
+
+    const entries = await this.synthesize(sources);
+
     return {
-      entries: [
-        {
-          summary: `NotebookLM compiled ${sources.length} sources into notebook ${this.notebookId}`,
-          facts: sources.map((s) => `Source: ${s.title}`),
-          tags: ['notebooklm', 'compiled'],
-        },
-      ],
+      entries,
       meta: {
         provider: 'notebooklm',
         notebookId: this.notebookId ?? undefined,
@@ -79,6 +84,50 @@ export class NotebookLmCompiler implements CompilerAdapter {
         builtAt: new Date().toISOString(),
       },
     };
+  }
+
+  /**
+   * Ask NotebookLM to synthesize knowledge from the uploaded sources and
+   * return structured KnowledgeEntry objects for the knowledge store.
+   */
+  private async synthesize(sources: Source[]): Promise<KnowledgeEntry[]> {
+    const queries = [
+      'Provide a comprehensive overview of all the content in this notebook. Cover the main topics, key ideas, and important context.',
+      'List the most important facts, insights, and conclusions from all sources in this notebook. Use bullet points.',
+    ];
+
+    const entries: KnowledgeEntry[] = [];
+
+    for (const question of queries) {
+      try {
+        const { text } = await this.client.sendChat(this.notebookId, question, this.sourceIds);
+        if (!text?.trim()) continue;
+
+        const lines = (text as string)
+          .split('\n')
+          .map((l: string) => l.replace(/^[-•*\d.]+\s*/, '').trim())
+          .filter(Boolean);
+
+        entries.push({
+          summary: lines[0] ?? text.slice(0, 200),
+          facts: lines.slice(1),
+          tags: ['notebooklm', 'synthesized'],
+        });
+      } catch (e) {
+        console.warn('[mem-plugin/notebooklm] synthesis query failed:', e);
+      }
+    }
+
+    // Fallback: if all queries failed, at least record source titles.
+    if (entries.length === 0) {
+      entries.push({
+        summary: `NotebookLM notebook ${this.notebookId} — ${sources.length} sources uploaded`,
+        facts: sources.map((s) => `Source: ${s.title}`),
+        tags: ['notebooklm', 'compiled'],
+      });
+    }
+
+    return entries;
   }
 
   async query(question: string): Promise<QueryResult> {

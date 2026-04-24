@@ -78,8 +78,11 @@ export default class MemPluginBuild extends Plugin {
       const orchestrator = new BuildOrchestrator(this.app, this.settings);
       const report = await orchestrator.run(compiler);
       notice.hide();
+      const folderInfo = report.effectiveFolders.length
+        ? ` [${report.effectiveFolders.join(', ')}]`
+        : ' [entire vault]';
       new Notice(
-        `Build done: ${report.sourceCount} sources → ${report.entryCount} entries` +
+        `Build done: ${report.sourceCount} sources${folderInfo} → ${report.entryCount} entries` +
           (report.writtenFiles.length ? ` (${report.writtenFiles.length} files written)` : '')
       );
     } catch (e) {
