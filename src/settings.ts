@@ -100,6 +100,79 @@ export class MemPluginSettingTab extends PluginSettingTab {
         })
       );
 
+    // ── Build pipeline ────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'Build pipeline' });
+
+    new Setting(containerEl)
+      .setName('Incremental build')
+      .setDesc('Only compile new or changed files since the last build. Highly recommended for large vaults.')
+      .addToggle((t) =>
+        t.setValue(s.incrementalBuild).onChange(async (v) => {
+          s.incrementalBuild = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Pre-summarize documents')
+      .setDesc('Summarize each document with a fast LLM before sending to the main compiler. Reduces noise and improves quality. Requires Preprocessor API key below.')
+      .addToggle((t) =>
+        t.setValue(s.preSummarize).onChange(async (v) => {
+          s.preSummarize = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Extract concepts')
+      .setDesc('After compilation, extract cross-document concepts as separate knowledge entries. Requires Preprocessor API key below.')
+      .addToggle((t) =>
+        t.setValue(s.extractConcepts).onChange(async (v) => {
+          s.extractConcepts = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    containerEl.createEl('h4', { text: 'Preprocessor LLM (for summarization & concepts)' });
+
+    new Setting(containerEl)
+      .setName('API key')
+      .setDesc('Anthropic API key used for pre-summarization and concept extraction.')
+      .addText((t) =>
+        t
+          .setPlaceholder('sk-ant-...')
+          .setValue(s.preprocessor.apiKey ?? '')
+          .onChange(async (v) => {
+            s.preprocessor.apiKey = v.trim() || undefined;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Model')
+      .setDesc('Model for preprocessing. Default: claude-haiku-4-5-20251001 (fast & cheap).')
+      .addText((t) =>
+        t
+          .setPlaceholder('claude-haiku-4-5-20251001')
+          .setValue(s.preprocessor.model ?? '')
+          .onChange(async (v) => {
+            s.preprocessor.model = v.trim() || undefined;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Base URL (optional)')
+      .setDesc('For proxies or compatible endpoints.')
+      .addText((t) =>
+        t
+          .setValue(s.preprocessor.baseURL ?? '')
+          .onChange(async (v) => {
+            s.preprocessor.baseURL = v.trim() || undefined;
+            await this.plugin.saveSettings();
+          })
+      );
+
     this.renderProviderSection(containerEl);
   }
 

@@ -1,6 +1,6 @@
 {
   "name": "mem-plugin-obsidian",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "description": "Obsidian plugin for LLM Build — compiles your vault into a queryable knowledge base via pluggable compilers (NotebookLM / Anthropic / OpenAI / Gemini / Custom).",
   "main": "main.js",
   "scripts": {

@@ -76,14 +76,34 @@ export default class MemPluginBuild extends Plugin {
     try {
       const compiler = this.getCompiler();
       const orchestrator = new BuildOrchestrator(this.app, this.settings);
-      const report = await orchestrator.run(compiler);
+      const report = await orchestrator.run(compiler, (stage, done, total) => {
+        notice.setMessage(`${stage} ${done}/${total}…`);
+      });
+
+      // Persist the notebook ID so it survives plugin reloads/updates.
+      if (report.notebookId && this.settings.provider === 'notebooklm') {
+        const nblm = this.settings.providers.notebooklm;
+        if (nblm.pinnedNotebookId !== report.notebookId) {
+          nblm.pinnedNotebookId = report.notebookId;
+          await this.saveSettings();
+        }
+      }
+
       notice.hide();
+
+      if (report.newCount === 0) {
+        new Notice(`Build done: no changes since last build (${report.sourceCount} sources total)`);
+        return;
+      }
+
       const folderInfo = report.effectiveFolders.length
         ? ` [${report.effectiveFolders.join(', ')}]`
         : ' [entire vault]';
+      const conceptInfo = report.conceptCount > 0 ? `, ${report.conceptCount} concepts` : '';
       new Notice(
-        `Build done: ${report.sourceCount} sources${folderInfo} → ${report.entryCount} entries` +
-          (report.writtenFiles.length ? ` (${report.writtenFiles.length} files written)` : '')
+        `Build done: ${report.newCount}/${report.sourceCount} sources${folderInfo}` +
+        ` → ${report.entryCount} entries${conceptInfo}` +
+        (report.writtenFiles.length ? ` (${report.writtenFiles.length} files written)` : '')
       );
     } catch (e) {
       notice.hide();

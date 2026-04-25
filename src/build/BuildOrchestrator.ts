@@ -4,10 +4,15 @@ import type { App, TFile } from 'obsidian';
 import type { CompilerAdapter } from '../compilers/CompilerAdapter.js';
 import type { BuildResult, MemPluginSettings, Source } from '../types.js';
 import { KnowledgeStoreWriter } from '../store/KnowledgeStoreWriter.js';
+import { BuildState } from './BuildState.js';
+import { SummaryPreprocessor } from './SummaryPreprocessor.js';
+import { ConceptExtractor } from './ConceptExtractor.js';
 
 export interface BuildReport {
   sourceCount: number;
+  newCount: number;        // sources actually processed (incremental)
   entryCount: number;
+  conceptCount: number;
   writtenFiles: string[];
   provider: string;
   notebookId?: string;
@@ -77,27 +82,92 @@ export class BuildOrchestrator {
     }
   }
 
-  async run(compiler: CompilerAdapter): Promise<BuildReport> {
+  async run(
+    compiler: CompilerAdapter,
+    onProgress?: (stage: string, done: number, total: number) => void,
+  ): Promise<BuildReport> {
+    const { incrementalBuild, preSummarize, extractConcepts, preprocessor, knowledgeStorePath } = this.settings;
+
+    // ── 1. Collect sources ────────────────────────────────────────────────
     const [{ sources: vaultSources, effectiveFolders }, rawSources] = await Promise.all([
       this.collectVaultSources(),
       this.collectRawStoreSources(),
     ]);
-    const sources = [...vaultSources, ...rawSources];
-    if (sources.length === 0) {
-      return { sourceCount: 0, entryCount: 0, writtenFiles: [], provider: compiler.id, effectiveFolders };
+    const allSources = [...vaultSources, ...rawSources];
+
+    // ── 2. Incremental filter ─────────────────────────────────────────────
+    let state: BuildState | null = null;
+    let toProcess = allSources;
+
+    if (incrementalBuild && knowledgeStorePath) {
+      state = new BuildState(knowledgeStorePath);
+      await state.load();
+      toProcess = allSources.filter((s) => state!.isChanged(s));
     }
 
-    const result: BuildResult = await compiler.build(sources);
+    const newCount = toProcess.length;
 
+    if (newCount === 0) {
+      return {
+        sourceCount: allSources.length,
+        newCount: 0,
+        entryCount: 0,
+        conceptCount: 0,
+        writtenFiles: [],
+        provider: compiler.id,
+        effectiveFolders,
+      };
+    }
+
+    // ── 3. Pre-summarize ──────────────────────────────────────────────────
+    let processedSources = toProcess;
+    if (preSummarize && preprocessor.apiKey) {
+      const summarizer = new SummaryPreprocessor({
+        apiKey: preprocessor.apiKey,
+        baseURL: preprocessor.baseURL,
+        model: preprocessor.model,
+      });
+      processedSources = await summarizer.process(toProcess, (done, total) =>
+        onProgress?.('Summarizing', done, total),
+      );
+    }
+
+    // ── 4. Main compile ───────────────────────────────────────────────────
+    const result: BuildResult = await compiler.build(processedSources);
+
+    // ── 5. Concept extraction ─────────────────────────────────────────────
+    let conceptEntries: typeof result.entries = [];
+    if (extractConcepts && preprocessor.apiKey) {
+      try {
+        const extractor = new ConceptExtractor({
+          apiKey: preprocessor.apiKey,
+          baseURL: preprocessor.baseURL,
+          model: preprocessor.model,
+        });
+        conceptEntries = await extractor.extract(processedSources);
+      } catch (e) {
+        console.warn('[mem-plugin] concept extraction failed:', e);
+      }
+    }
+
+    // ── 6. Write to knowledge store ───────────────────────────────────────
     let writtenFiles: string[] = [];
-    if (this.settings.knowledgeStorePath) {
-      const writer = new KnowledgeStoreWriter(this.settings.knowledgeStorePath);
-      writtenFiles = await writer.write(result.entries);
+    if (knowledgeStorePath) {
+      const writer = new KnowledgeStoreWriter(knowledgeStorePath);
+      writtenFiles = await writer.write([...result.entries, ...conceptEntries]);
+    }
+
+    // ── 7. Persist build state ────────────────────────────────────────────
+    if (state) {
+      for (const src of toProcess) state.markProcessed(src);
+      await state.save();
     }
 
     return {
-      sourceCount: sources.length,
+      sourceCount: allSources.length,
+      newCount,
       entryCount: result.entries.length,
+      conceptCount: conceptEntries.length,
       writtenFiles,
       provider: compiler.id,
       notebookId: result.meta?.notebookId,

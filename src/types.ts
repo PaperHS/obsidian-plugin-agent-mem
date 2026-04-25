@@ -35,6 +35,13 @@ export interface ProviderConfig {
   extraHeaders?: Record<string, string>;
 }
 
+export interface PreprocessorConfig {
+  apiKey?: string;
+  baseURL?: string;
+  /** Model for summarization and concept extraction. Default: claude-haiku-4-5-20251001 */
+  model?: string;
+}
+
 export interface MemPluginSettings {
   provider: ProviderId;
   knowledgeStorePath: string;   // absolute path, written in mem-plugin-compatible format
@@ -44,6 +51,17 @@ export interface MemPluginSettings {
   fileExtensions: string[];     // ['.md'] by default
   autoBuildOnChange: boolean;
   autoBuildDebounceMs: number;
+
+  // ── Build pipeline options ──────────────────────────────────────────────
+  /** Only compile new/changed files since last build. */
+  incrementalBuild: boolean;
+  /** Pre-summarize each document before sending to the main compiler. */
+  preSummarize: boolean;
+  /** Extract cross-document concepts as separate knowledge entries. */
+  extractConcepts: boolean;
+  /** LLM used for pre-summarization and concept extraction. */
+  preprocessor: PreprocessorConfig;
+
   providers: {
     notebooklm: {
       transport: 'auto' | 'browser' | 'http' | 'curl-impersonate' | 'tls-client';
@@ -67,6 +85,10 @@ export const DEFAULT_SETTINGS: MemPluginSettings = {
   fileExtensions: ['.md'],
   autoBuildOnChange: false,
   autoBuildDebounceMs: 60_000,
+  incrementalBuild: true,
+  preSummarize: false,
+  extractConcepts: false,
+  preprocessor: {},
   providers: {
     notebooklm: { transport: 'auto' },
     anthropic: { model: 'claude-sonnet-4-5' },
