@@ -48,9 +48,19 @@ export async function checkSession(homeDir?: string): Promise<SessionStatus> {
   const sessionPath: string = lib.getSessionPath();
   let loggedIn = false;
   try {
-    loggedIn = typeof lib.hasValidSession === 'function'
-      ? Boolean(await lib.hasValidSession())
-      : false;
+    const session = typeof lib.loadSession === 'function' ? await lib.loadSession(sessionPath) : null;
+    if (session) {
+      const isValid = typeof lib.hasValidSession === 'function'
+        ? Boolean(await lib.hasValidSession(sessionPath))
+        : true;
+      if (isValid) {
+        loggedIn = true;
+      } else if (typeof lib.refreshTokens === 'function') {
+        // Tokens expired but cookies may still be valid — attempt silent refresh.
+        await lib.refreshTokens(session, sessionPath);
+        loggedIn = true;
+      }
+    }
   } catch {
     loggedIn = false;
   }

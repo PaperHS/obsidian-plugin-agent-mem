@@ -35,16 +35,41 @@ export class NotebookLmCompiler implements CompilerAdapter {
     if (!Ctor) throw new Error('notebooklm-client: NotebookClient export not found');
     if (this.opts.homeDir && typeof mod.setHomeDir === 'function') mod.setHomeDir(this.opts.homeDir);
 
-    // Fail fast if no session — connect() hangs indefinitely without one.
-    if (typeof mod.hasValidSession === 'function') {
-      const valid = await mod.hasValidSession();
-      if (!valid) {
-        throw new Error('No valid NotebookLM session — please log in via Settings → Provider settings → Log in to NotebookLM');
+    // Fail fast if no session file at all — connect() hangs indefinitely without one.
+    // Short-lived tokens (~1-2h) may be expired, but long-lived cookies (weeks/months)
+    // can refresh them automatically. Try refreshTokens() before giving up.
+    const sessionPath: string | undefined = typeof mod.getSessionPath === 'function'
+      ? mod.getSessionPath()
+      : undefined;
+
+    let session: any = null;
+    if (typeof mod.loadSession === 'function') {
+      session = await mod.loadSession(sessionPath);
+    }
+
+    if (!session) {
+      throw new Error('No valid NotebookLM session — please log in via Settings → Provider settings → Log in to NotebookLM');
+    }
+
+    const isValid = typeof mod.hasValidSession === 'function'
+      ? await mod.hasValidSession(sessionPath)
+      : true;
+
+    if (!isValid && typeof mod.refreshTokens === 'function') {
+      try {
+        console.log('[mem-plugin/notebooklm] tokens expired, refreshing…');
+        session = await mod.refreshTokens(session, sessionPath);
+      } catch (e) {
+        console.warn('[mem-plugin/notebooklm] token refresh failed:', e);
+        throw new Error('NotebookLM session expired and could not be refreshed — please log in again via Settings');
       }
     }
 
     this.client = new Ctor();
-    const connectOpts: any = { transport: this.opts.transport ?? 'auto' };
+    const connectOpts: any = {
+      transport: this.opts.transport ?? 'auto',
+      session,  // pass refreshed session directly, skipping disk re-read
+    };
     if (this.opts.chromePath) connectOpts.chromePath = this.opts.chromePath;
     await this.client.connect(connectOpts);
   }
