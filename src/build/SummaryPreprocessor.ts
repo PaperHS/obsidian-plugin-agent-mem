@@ -31,6 +31,7 @@ export class SummaryPreprocessor {
   constructor(cfg: PreprocessorConfig) {
     this.client = new Anthropic({
       apiKey: cfg.apiKey,
+      dangerouslyAllowBrowser: true,
       ...(cfg.baseURL ? { baseURL: cfg.baseURL } : {}),
     });
     this.model = cfg.model ?? 'claude-haiku-4-5-20251001';

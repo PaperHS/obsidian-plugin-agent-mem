@@ -9,7 +9,7 @@ export class AnthropicCompiler implements CompilerAdapter {
   private model: string;
 
   constructor(cfg: ProviderConfig) {
-    const opts: ConstructorParameters<typeof Anthropic>[0] = {};
+    const opts: ConstructorParameters<typeof Anthropic>[0] = { dangerouslyAllowBrowser: true };
     if (cfg.apiKey) opts.apiKey = cfg.apiKey;
     if (cfg.baseURL) opts.baseURL = cfg.baseURL;
     this.client = new Anthropic(opts);
